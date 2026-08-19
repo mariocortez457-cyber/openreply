@@ -80,6 +80,7 @@ model Workspace {
   instagramAccounts InstagramAccount[]
   automations       Automation[]
   dmLogs            DmLog[]
+  leadMagnetDeliveries LeadMagnetDelivery[]
   trackedLinks      TrackedLink[]
   linkClicks        LinkClick[]
   webhookEvents     WebhookEvent[]
@@ -139,6 +140,7 @@ model InstagramAccount {
   workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   automations Automation[]
   dmLogs      DmLog[]
+  leadMagnetDeliveries LeadMagnetDelivery[]
   linkClicks  LinkClick[]
   followerSnapshots FollowerSnapshot[]
 
@@ -209,6 +211,7 @@ model Automation {
   workspace        Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   instagramAccount InstagramAccount @relation(fields: [instagramAccountId], references: [id], onDelete: Cascade)
   dmLogs           DmLog[]
+  leadMagnetDeliveries LeadMagnetDelivery[]
   trackedLinks     TrackedLink[]
   linkClicks       LinkClick[]
 
@@ -245,11 +248,44 @@ model DmLog {
   workspace        Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   automation       Automation       @relation(fields: [automationId], references: [id], onDelete: Cascade)
   instagramAccount InstagramAccount @relation(fields: [instagramAccountId], references: [id], onDelete: Cascade)
+  leadMagnetDelivery LeadMagnetDelivery?
 
   @@unique([automationId, commentId])
   @@index([workspaceId])
   @@index([automationId])
   @@index([instagramAccountId])
+  @@index([status])
+}
+
+model LeadMagnetDelivery {
+  id                 String                   @id @default(cuid())
+  workspaceId        String
+  automationId       String
+  instagramAccountId String
+  sourceDmLogId      String                   @unique
+  instagramMessageId String
+
+  commenterId   String
+  commenterName String?
+  email         String
+  status        LeadMagnetDeliveryStatus @default(PENDING)
+  attempts      Int                      @default(0)
+  emailSentAt   DateTime?
+  dmConfirmedAt DateTime?
+  errorMessage  String?
+  createdAt     DateTime                 @default(now())
+  updatedAt     DateTime                 @updatedAt
+
+  workspace        Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  automation       Automation       @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  instagramAccount InstagramAccount @relation(fields: [instagramAccountId], references: [id], onDelete: Cascade)
+  sourceDmLog      DmLog            @relation(fields: [sourceDmLogId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId])
+  @@index([automationId])
+  @@index([instagramAccountId])
+  @@index([commenterId])
+  @@index([email])
   @@index([status])
 }
 
@@ -366,6 +402,12 @@ enum DmStatus {
   SKIPPED_RATE_LIMIT
   SKIPPED_PLAN_LIMIT
   SKIPPED_NO_MATCH
+}
+
+enum LeadMagnetDeliveryStatus {
+  PENDING
+  SENT
+  FAILED
 }
 
 enum WebhookStatus {
