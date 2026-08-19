@@ -38,6 +38,11 @@ import {
   renderMessageWithTracking,
   renderMessageWithoutLink,
 } from "@/lib/tracking/message";
+import {
+  extractEmailAddress,
+  getLeadMagnetConfig,
+  sendLeadMagnetEmail,
+} from "@/lib/email/lead-magnet";
 
 const BACKOFF_DELAYS = [5 * 60 * 1000, 15 * 60 * 1000, 45 * 60 * 1000];
 
@@ -928,6 +933,184 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
 }
 
 /**
+ * Complete the deployment-level lead-magnet funnel after a keyword comment.
+ *
+ * A normal campaign sends the first private reply asking for an email address.
+ * When the user replies with one, this lookup ties the message to their latest
+ * successful comment interaction for LEAD_MAGNET_KEYWORD. The email request is
+ * idempotent by the source comment log, and a completed delivery closes only that
+ * comment interaction; a later BOOK comment can start a fresh request.
+ */
+async function processLeadMagnetReply(
+  job: Job<ProcessMessageJob>
+): Promise<boolean> {
+  const config = getLeadMagnetConfig();
+  const email = extractEmailAddress(job.data.messageText);
+  if (!config || !email) return false;
+
+  const { instagramAccountId, messageId, senderId } = job.data;
+  const replyWindowStart = new Date(
+    Date.now() - config.replyWindowHours * 60 * 60 * 1000
+  );
+  const sourceLog = await prisma.dmLog.findFirst({
+    where: {
+      commenterId: senderId,
+      status: "SENT",
+      createdAt: { gte: replyWindowStart },
+      AND: [
+        { commentId: { not: { startsWith: "dm:" } } },
+        { commentId: { not: { startsWith: "reveal:" } } },
+      ],
+      automation: {
+        isActive: true,
+        keywords: { has: config.keyword },
+        instagramAccount: { instagramId: instagramAccountId },
+      },
+    },
+    select: {
+      id: true,
+      automationId: true,
+      commenterName: true,
+      instagramAccountId: true,
+      workspaceId: true,
+      automation: {
+        select: {
+          instagramAccount: {
+            select: { accessToken: true, instagramId: true },
+          },
+        },
+      },
+    },
+    orderBy: { createdAt: "desc" },
+  });
+
+  if (!sourceLog) return false;
+
+  const existingDelivery = await prisma.leadMagnetDelivery.findUnique({
+    where: { sourceDmLogId: sourceLog.id },
+  });
+  if (existingDelivery?.emailSentAt) return true;
+
+  const deliveryBase = {
+    workspaceId: sourceLog.workspaceId,
+    automationId: sourceLog.automationId,
+    instagramAccountId: sourceLog.instagramAccountId,
+    sourceDmLogId: sourceLog.id,
+    instagramMessageId: messageId,
+    commenterId: senderId,
+    commenterName: sourceLog.commenterName,
+    email,
+  };
+
+  await prisma.leadMagnetDelivery.upsert({
+    where: { sourceDmLogId: sourceLog.id },
+    create: { ...deliveryBase, status: "PENDING" },
+    update: {
+      instagramMessageId: messageId,
+      email,
+      status: "PENDING",
+      attempts: job.attemptsMade + 1,
+      errorMessage: null,
+    },
+  });
+
+  try {
+    await sendLeadMagnetEmail({
+      config,
+      idempotencyScope: sourceLog.id,
+      to: email,
+    });
+  } catch (error) {
+    await prisma.leadMagnetDelivery.update({
+      where: { sourceDmLogId: sourceLog.id },
+      data: {
+        status: "FAILED",
+        attempts: job.attemptsMade + 1,
+        errorMessage: formatError(error),
+      },
+    });
+    throw error;
+  }
+
+  await prisma.leadMagnetDelivery.update({
+    where: { sourceDmLogId: sourceLog.id },
+    data: {
+      status: "SENT",
+      emailSentAt: new Date(),
+      errorMessage: null,
+    },
+  });
+
+  const encryptedToken = sourceLog.automation.instagramAccount.accessToken;
+  if (!encryptedToken) {
+    await prisma.leadMagnetDelivery.update({
+      where: { sourceDmLogId: sourceLog.id },
+      data: {
+        errorMessage: "Ebook email sent; Instagram confirmation skipped: no access token",
+      },
+    });
+    return true;
+  }
+
+  let accessToken: string;
+  try {
+    accessToken = decryptToken(encryptedToken);
+  } catch {
+    await prisma.leadMagnetDelivery.update({
+      where: { sourceDmLogId: sourceLog.id },
+      data: {
+        errorMessage:
+          "Ebook email sent; Instagram confirmation skipped: token decryption failed",
+      },
+    });
+    return true;
+  }
+
+  const usage = await reserveWorkspaceDMSend(sourceLog.workspaceId);
+  if (!usage.allowed) {
+    await prisma.leadMagnetDelivery.update({
+      where: { sourceDmLogId: sourceLog.id },
+      data: {
+        errorMessage: "Ebook email sent; Instagram confirmation skipped by DM limit",
+      },
+    });
+    return true;
+  }
+
+  try {
+    await sendDirectMessage(
+      accessToken,
+      sourceLog.automation.instagramAccount.instagramId,
+      senderId,
+      renderMessageWithoutLink({
+        message: config.confirmationMessage,
+        commenterName: sourceLog.commenterName,
+      })
+    );
+    await prisma.leadMagnetDelivery.update({
+      where: { sourceDmLogId: sourceLog.id },
+      data: {
+        dmConfirmedAt: new Date(),
+        errorMessage: null,
+      },
+    });
+  } catch (error) {
+    await releaseWorkspaceDMReservation(
+      sourceLog.workspaceId,
+      usage.periodStart
+    );
+    await prisma.leadMagnetDelivery.update({
+      where: { sourceDmLogId: sourceLog.id },
+      data: {
+        errorMessage: `Ebook email sent; Instagram confirmation failed: ${formatError(error)}`,
+      },
+    });
+  }
+
+  return true;
+}
+
+/**
  * Reply to an inbound DM whose text matches a campaign's keywords.
  *
  * The user has messaged us, so the conversation is already open: this path
@@ -937,6 +1120,8 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
  */
 async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
   const { instagramAccountId, messageId, messageText, senderId } = job.data;
+
+  if (await processLeadMagnetReply(job)) return;
 
   const automations = await prisma.automation.findMany({
     where: {
@@ -1283,4 +1468,3 @@ export function createDMWorker(): Worker<DmQueueJob> {
 
   return worker;
 }
-
