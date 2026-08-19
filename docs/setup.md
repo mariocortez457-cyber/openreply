@@ -95,6 +95,13 @@ Copy `.env.example` to `.env` for local work, or set these in Vercel and Railway
 | `RESEND_API_KEY` | Resend key. Login is email magic links only, so without this nobody can sign in. |
 | `EMAIL_FROM` | A sender on a domain you verified in Resend. The placeholder will not deliver. |
 | `EMAIL_SERVER` | Optional. An SMTP URL, for example `smtps://login%40example.com:password@mail.example.com:465`. Set it to send magic links through your own mail server instead of Resend; then `RESEND_API_KEY` is not needed. URL-encode special characters in the user and password (`@` becomes `%40`). Port 465 with `smtps://` is implicit TLS, port 587 with `smtp://` is STARTTLS. |
+| `LEAD_MAGNET_KEYWORD` | Optional worker-only funnel keyword, for example `BOOK`. Leave unset to disable email capture. |
+| `LEAD_MAGNET_EBOOK_URL` | Public HTTPS URL for the requested ebook. Required when the lead-magnet funnel is enabled. |
+| `LEAD_MAGNET_EMAIL_FROM` | Optional verified Resend sender for ebook delivery. Falls back to `EMAIL_FROM`. |
+| `LEAD_MAGNET_EMAIL_SUBJECT` | Optional email subject. Defaults to `Your Futures Ebook`. |
+| `LEAD_MAGNET_EMAIL_INTRO` | Optional plain-text introduction used in the ebook email. |
+| `LEAD_MAGNET_DM_CONFIRMATION` | Optional Instagram confirmation after the email is accepted by Resend. |
+| `LEAD_MAGNET_REPLY_WINDOW_HOURS` | How long an email reply can be tied to the person's most recent keyword comment. Defaults to `168` (7 days), clamped to 1–720 hours. |
 | `META_GRAPH_API_VERSION` | Graph API version, for example `v25.0`. |
 | `INSTAGRAM_APP_ID` | From the Meta app, see Step 6. |
 | `INSTAGRAM_APP_SECRET` | From the Meta app. |
@@ -110,6 +117,33 @@ Optional, for tuning the polling reconciler (defaults are fine to start):
 | `COMMENT_POLL_INTERVAL_MS` | `300000` | How often the worker sweeps for missed comments (5 min). |
 | `COMMENT_POLL_MAX_PER_SWEEP` | `30` | Max new comments each campaign acts on per sweep. Keep it conservative; higher gets closer to Instagram's rate limits. |
 | `COMMENT_POLL_LOOKBACK_HOURS` | `72` | How far back a sweep considers comments. |
+
+### Optional BOOK-to-email ebook funnel
+
+Set the `LEAD_MAGNET_*` variables on the Railway worker. This delivery path uses
+the Resend HTTP API even if login magic links use `EMAIL_SERVER`, so the worker
+also needs `RESEND_API_KEY`. Resend must verify the domain in
+`LEAD_MAGNET_EMAIL_FROM` (or the fallback `EMAIL_FROM`) before it can send to
+arbitrary readers.
+
+Create a normal campaign with these settings:
+
+1. Use `BOOK` as a whole-word comment keyword. It must match
+   `LEAD_MAGNET_KEYWORD`.
+2. Leave Opening DM and DM keyword trigger off.
+3. Use the main DM message to request the address, for example: “Reply with the
+   email address where you want the Futures Ebook sent. By replying, you agree
+   to receive this requested ebook by email. We will not add you to a marketing
+   list.”
+4. Do not add the ebook as the campaign's tracked link; the worker sends the
+   `LEAD_MAGNET_EBOOK_URL` by email after it receives a valid address.
+
+The worker stores one `LeadMagnetDelivery` row per successful keyword comment,
+including the supplied email address and delivery state. A Resend idempotency
+key prevents queue retries from sending the ebook twice. A later `BOOK` comment
+starts a new request. Because email addresses are personal data, update your
+privacy and deletion disclosures for the retention policy you choose before
+enabling this funnel publicly.
 
 ## The Meta app
 
