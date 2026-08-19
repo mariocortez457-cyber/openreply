@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const {
   mockPrisma,
@@ -27,6 +27,11 @@ const {
       upsert: vi.fn(),
       update: vi.fn(),
       create: vi.fn(),
+    },
+    leadMagnetDelivery: {
+      findUnique: vi.fn(),
+      upsert: vi.fn(),
+      update: vi.fn(),
     },
     instagramAccount: {
       findUnique: vi.fn(),
@@ -225,6 +230,9 @@ beforeEach(() => {
   );
   mockPrisma.dmLog.upsert.mockResolvedValue({});
   mockPrisma.dmLog.update.mockResolvedValue({});
+  mockPrisma.leadMagnetDelivery.findUnique.mockResolvedValue(null);
+  mockPrisma.leadMagnetDelivery.upsert.mockResolvedValue({});
+  mockPrisma.leadMagnetDelivery.update.mockResolvedValue({});
   mockPrisma.instagramAccount.findUnique.mockResolvedValue({
     workspaceId: "workspace_123",
   });
@@ -273,6 +281,7 @@ beforeEach(() => {
     message_id: "msg_006",
   });
   mockGetUserFollowStatus.mockResolvedValue(true);
+  vi.stubEnv("LEAD_MAGNET_KEYWORD", "");
 });
 
 describe("DM Worker — Full Pipeline", () => {
@@ -818,6 +827,11 @@ describe("DM Worker — Full Pipeline", () => {
   });
 });
 
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
+});
+
 describe("DM Worker — one private reply per comment", () => {
   it("should skip a campaign when another already used the comment's private reply", async () => {
     mockPrisma.dmLog.findFirst.mockImplementation(
@@ -895,6 +909,147 @@ describe("DM Worker — one private reply per comment", () => {
         data: expect.objectContaining({ status: "SENT" }),
       })
     );
+  });
+});
+
+describe("DM Worker — lead magnet email capture", () => {
+  function enableLeadMagnet() {
+    vi.stubEnv("LEAD_MAGNET_KEYWORD", "BOOK");
+    vi.stubEnv("LEAD_MAGNET_EBOOK_URL", "https://example.com/futures-ebook");
+    vi.stubEnv("LEAD_MAGNET_EMAIL_FROM", "Stock Charts Academy <ebook@example.com>");
+    vi.stubEnv("LEAD_MAGNET_EMAIL_SUBJECT", "Your Futures Ebook");
+    vi.stubEnv("RESEND_API_KEY", "re_test_key");
+  }
+
+  function createLeadReplyJob(messageText = "Trader@Example.com") {
+    return {
+      name: "process-message",
+      data: {
+        instagramAccountId: "ig_456",
+        messageId: "mid_email_abc",
+        messageText,
+        senderId: "commenter_999",
+      },
+      id: "lead_message_job_001",
+      attemptsMade: 0,
+    };
+  }
+
+  const sourceCommentLog = {
+    id: "dm_source_book_1",
+    workspaceId: "workspace_123",
+    automationId: "auto_789",
+    instagramAccountId: "ig_account_row_1",
+    commenterName: "commenter_user",
+    automation: {
+      instagramAccount: {
+        accessToken: "encrypted_token_abc",
+        instagramId: "ig_456",
+      },
+    },
+  };
+
+  it("emails the ebook once and confirms delivery in Instagram", async () => {
+    enableLeadMagnet();
+    mockPrisma.dmLog.findFirst.mockResolvedValue(sourceCommentLog);
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: vi.fn().mockResolvedValue(""),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const processor = getProcessor();
+    await processor(createLeadReplyJob());
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.resend.com/emails",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          Authorization: "Bearer re_test_key",
+          "Idempotency-Key": expect.stringMatching(/^openreply-lead-/),
+        }),
+      })
+    );
+    const request = fetchMock.mock.calls[0]?.[1] as { body: string };
+    expect(JSON.parse(request.body)).toEqual(
+      expect.objectContaining({
+        from: "Stock Charts Academy <ebook@example.com>",
+        to: ["trader@example.com"],
+        subject: "Your Futures Ebook",
+      })
+    );
+    expect(mockPrisma.leadMagnetDelivery.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { sourceDmLogId: "dm_source_book_1" },
+        create: expect.objectContaining({
+          email: "trader@example.com",
+          instagramMessageId: "mid_email_abc",
+          status: "PENDING",
+        }),
+      })
+    );
+    expect(mockPrisma.leadMagnetDelivery.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "SENT",
+          emailSentAt: expect.any(Date),
+        }),
+      })
+    );
+    expect(mockSendDirectMessage).toHaveBeenCalledWith(
+      "decrypted_token",
+      "ig_456",
+      "commenter_999",
+      "Sent! Check your inbox (and spam or promotions) for your futures ebook."
+    );
+    expect(mockPrisma.automation.findMany).not.toHaveBeenCalled();
+  });
+
+  it("does not send again after this comment already produced an email", async () => {
+    enableLeadMagnet();
+    mockPrisma.dmLog.findFirst.mockResolvedValue(sourceCommentLog);
+    mockPrisma.leadMagnetDelivery.findUnique.mockResolvedValue({
+      emailSentAt: new Date(),
+    });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const processor = getProcessor();
+    await processor(createLeadReplyJob());
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
+    expect(mockPrisma.automation.findMany).not.toHaveBeenCalled();
+  });
+
+  it("records a failed email attempt so the queue can retry it", async () => {
+    enableLeadMagnet();
+    mockPrisma.dmLog.findFirst.mockResolvedValue(sourceCommentLog);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 422,
+        text: vi.fn().mockResolvedValue("sender domain is not verified"),
+      })
+    );
+
+    const processor = getProcessor();
+    await expect(processor(createLeadReplyJob())).rejects.toThrow(
+      "Resend email failed (422)"
+    );
+
+    expect(mockPrisma.leadMagnetDelivery.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "FAILED",
+          errorMessage: expect.stringContaining("sender domain is not verified"),
+        }),
+      })
+    );
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
   });
 });
 
